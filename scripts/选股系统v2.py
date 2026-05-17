@@ -52,6 +52,7 @@ def get_last_trading_date():
 YESTERDAY_FMT = (datetime.date.today() - timedelta(days=1)).strftime("%Y%m%d")
 TODAY_FMT = datetime.date.today().strftime("%Y%m%d")
 PUSH_TIME = "09:28"
+MAX_WORKERS = 20
 
 logging.basicConfig(
     level=logging.INFO,
