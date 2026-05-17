@@ -6,7 +6,7 @@
 推送时间：09:28
 """
 
-import os, sys, re, json, time, datetime, sqlite3, logging
+import os, sys, re, json, time, datetime, sqlite3, logging, pandas as pd, requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from pathlib import Path
@@ -18,10 +18,35 @@ REPORT_DIR = WORKDIR / "每日选股"
 SCRIPTS_DIR = WORKDIR / "scripts"
 DB_PATH = DATA_DIR / "stock_pool.db"
 
-MAX_WORKERS = 20
-YESTERDAY_FMT = (datetime.date.today() - timedelta(days=1)).strftime("%Y%m%d")
-TODAY_FMT = datetime.date.today().strftime("%Y%m%d")
-PUSH_TIME = "09:28"
+def is_trading_day(date=None):
+    """判断指定日期是否为交易日（不含周末+节假日）"""
+    if date is None:
+        date = datetime.date.today()
+    
+    # 1. 周末不是交易日
+    if date.weekday() >= 5:
+        return False
+    
+    # 2. 用akshare获取交易日历
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        trading_dates = set(pd.to_datetime(df['trade_date']).dt.date.tolist())
+        return date in trading_dates
+    except:
+        # 网络失败时保守处理：认为是交易日
+        return True
+
+def get_last_trading_date():
+    """获取最近一个交易日（可能为今天或昨天）"""
+    today = datetime.date.today()
+    if is_trading_day(today):
+        return today
+    for i in range(1, 7):
+        d = today - datetime.timedelta(days=i)
+        if is_trading_day(d):
+            return d
+    return today
 
 logging.basicConfig(
     level=logging.INFO,
@@ -732,7 +757,13 @@ def build_text_report(results, top_sectors):
 # ============================================================
 
 def main():
+    """主选股流程（每天09:25运行）"""
     log.info("=== 选股系统v2 启动 ===")
+
+    # 检查是否为交易日
+    if not is_trading_day():
+        log.info("今日非交易日，跳过选股")
+        return []
 
     # Phase 1A: 3任务并行
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -823,6 +854,171 @@ def main():
     return results
 
 
+def daily_review():
+    """每日复盘模块（T+1日 16:00运行）
+    读取昨日选股，对比今日收盘，计算信号胜率"""
+    log.info("=== 每日复盘开始 ===")
+    
+    if not is_trading_day():
+        log.info("今日非交易日，跳过复盘")
+        return
+    
+    # 获取昨日日期
+    select_date = get_last_trading_date()
+    if select_date == datetime.date.today():
+        log.info("今日为选股日，复盘需等明日")
+        return
+    
+    select_date_str = select_date.strftime("%Y%m%d")
+    log.info(f"复盘日期: {select_date_str}")
+    
+    # 读取昨日选股结果
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute("""SELECT stock_code, stock_name, pool_type, signals, total_score 
+                       FROM stock_selection_v2 WHERE select_date=?""", (select_date_str,))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        log.error(f"读取选股结果失败: {e}")
+        return
+    
+    if not rows:
+        log.info("无选股记录，跳过复盘")
+        return
+    
+    log.info(f"昨日选股 {len(rows)} 只，开始复盘...")
+    
+    # 初始化信号统计
+    signal_stats = {}  # {signal_name: {total, wins, total_gain}}
+    
+    review_details = []
+    
+    for code, name, pool_type, signals_json, total_score in rows:
+        try:
+            # 获取今日开盘价和收盘价
+            market = 'sh' if code.startswith(('6','5')) else 'sz'
+            url = f"https://qt.gtimg.cn/q={market}{code}"
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            parts = r.text.split('~')
+            if len(parts) < 33:
+                continue
+            
+            today_open = float(parts[27])   # 开盘价
+            today_close = float(parts[3])    # 当前价/收盘价
+            yesterday_close = float(parts[4])  # 昨收
+            
+            # 今日涨幅（从开盘买入计算）
+            if today_open > 0:
+                change_pct = (today_close - today_open) / today_open * 100
+            else:
+                change_pct = (today_close - yesterday_close) / yesterday_close * 100
+            
+            # 标记结果
+            if change_pct > 9.5:
+                result_tag = "涨停 ✅"
+            elif change_pct > 5:
+                result_tag = "大赚 ✅"
+            elif change_pct > 0:
+                result_tag = "小赚 ✓"
+            elif change_pct > -3:
+                result_tag = "微亏 ⚠"
+            else:
+                result_tag = "亏损 ❌"
+            
+            review_details.append({
+                'code': code, 'name': name, 'pool': pool_type,
+                'score': total_score, 'change': change_pct, 'result': result_tag
+            })
+            
+            # 解析信号并统计
+            if signals_json:
+                try:
+                    signals = json.loads(signals_json) if isinstance(signals_json, str) else signals_json
+                except:
+                    signals = []
+            else:
+                signals = []
+            
+            for sig in signals:
+                if sig not in signal_stats:
+                    signal_stats[sig] = {'total': 0, 'wins': 0, 'total_gain': 0}
+                signal_stats[sig]['total'] += 1
+                signal_stats[sig]['total_gain'] += change_pct
+                if change_pct > 0:
+                    signal_stats[sig]['wins'] += 1
+            
+        except Exception as e:
+            log.error(f"复盘 {code} 失败: {e}")
+            continue
+    
+    # 写入复盘报告
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    review_file = REPORT_DIR / f"复盘-{select_date_str}.md"
+    
+    lines = [f"# 每日复盘 {select_date_str}\n", f"复盘时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"]
+    
+    # 信号胜率统计
+    lines.append("## 信号胜率统计\n")
+    lines.append("| 信号 | 次数 | 胜率 | 平均涨幅 |\n")
+    lines.append("|------|------|------|------|\n")
+    
+    sorted_signals = sorted(signal_stats.items(), key=lambda x: x[1]['wins']/max(x[1]['total'],1), reverse=True)
+    for sig, stat in sorted_signals:
+        win_rate = stat['wins'] / max(stat['total'], 1) * 100
+        avg_gain = stat['total_gain'] / max(stat['total'], 1)
+        lines.append(f"| {sig} | {stat['total']} | {win_rate:.1f}% | {avg_gain:+.2f}% |\n")
+    
+    # 股票复盘明细
+    lines.append("\n## 选股复盘明细\n")
+    lines.append("| # | 股票 | 代码 | 来源 | 评分 | 涨幅 | 结果 |\n")
+    lines.append("|---|------|------|------|------|------|------|\n")
+    
+    for i, r in enumerate(sorted(review_details, key=lambda x: x['change'], reverse=True), 1):
+        lines.append(f"| {i} | {r['name']} | {r['code']} | {r['pool']} | {r['score']:.0f} | {r['change']:+.2f}% | {r['result']} |\n")
+    
+    review_file.write_text(''.join(lines), encoding='utf-8')
+    log.info(f"[复盘] 报告已保存: {review_file}")
+    
+    # 更新信号胜率表
+    update_signal_win_rate(signal_stats, select_date_str)
+    
+    log.info("=== 每日复盘完成 ===")
+
+
+def update_signal_win_rate(signal_stats, date_str):
+    """更新信号胜率表"""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS signal_win_rate (
+            signal_name TEXT PRIMARY KEY,
+            total_count INTEGER,
+            win_count INTEGER,
+            avg_gain REAL,
+            win_rate REAL,
+            last_updated TEXT
+        )""")
+        
+        for sig, stat in signal_stats.items():
+            win_rate = stat['wins'] / max(stat['total'], 1) * 100
+            avg_gain = stat['total_gain'] / max(stat['total'], 1)
+            cur.execute("""INSERT OR REPLACE INTO signal_win_rate 
+                (signal_name, total_count, win_count, avg_gain, win_rate, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (sig, stat['total'], stat['wins'], avg_gain, win_rate, date_str))
+        
+        conn.commit()
+        conn.close()
+        log.info(f"[信号胜率] 更新 {len(signal_stats)} 个信号")
+    except Exception as e:
+        log.error(f"更新信号胜率失败: {e}")
+
+
 if __name__ == "__main__":
-    results = main()
-    print(f"完成，共推送 {len(results)} 只股票")
+    if len(sys.argv) > 1 and sys.argv[1] == "复盘":
+        daily_review()
+    else:
+        results = main()
+        print(f"完成，共推送 {len(results)} 只股票")
