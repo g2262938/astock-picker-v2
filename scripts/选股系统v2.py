@@ -48,6 +48,11 @@ def get_last_trading_date():
             return d
     return today
 
+# 运行时日期（每天09:25使用今日，16:00复盘用昨日）
+YESTERDAY_FMT = (datetime.date.today() - timedelta(days=1)).strftime("%Y%m%d")
+TODAY_FMT = datetime.date.today().strftime("%Y%m%d")
+PUSH_TIME = "09:28"
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
@@ -109,27 +114,42 @@ def get_kline_sina(code, market=None, datalen=250):
 # ============================================================
 
 def task_sector_fund_flow():
+    """板块资金流（周日API不可用时，用涨停股行业分布代替）"""
     try:
         import akshare as ak
-        df = ak.stock_sector_fund_flow_em()
-        if df is None or df.empty:
+        try:
+            df = ak.stock_sector_fund_flow_rank(indicator='今日', sector_type='行业资金流')
+        except:
+            df = None
+        
+        if df is None or df is not None and (df.empty or len(df) == 0):
+            # 备用：用涨停股行业分布
+            zt_df = ak.stock_zt_pool_em(date=YESTERDAY_FMT)
+            if zt_df is not None and len(zt_df) > 0:
+                sector_counts = zt_df.groupby('所属行业').size().sort_values(ascending=False)
+                result = {sector: float(count) for sector, count in sector_counts.head(15).items()}
+                log.info(f"[Phase1A-FUND] 备用涨停行业分布: {len(result)} 个板块")
+                return result
             return {}
-        cols = [c for c in df.columns if '主力净流入' in c or '净流入' in c]
-        if not cols:
-            cols = [c for c in df.columns if '金额' in c or '流入' in c]
-        flow_col = cols[0] if cols else df.columns[2]
-        sector_col = [c for c in df.columns if '名称' in c or '板块' in c][0] if [c for c in df.columns if '名称' in c or '板块' in c] else df.columns[0]
-        df_sorted = df.sort_values(flow_col, ascending=False).head(20)
-        result = {}
-        for _, row in df_sorted.iterrows():
-            name = str(row.get(sector_col, '')).strip()
-            val_str = str(row.get(flow_col, 0))
-            val = safe_float(val_str.replace(',', '').replace('亿', '').replace('万', ''))
-            if '万' in val_str:
-                val /= 10000
-            result[name] = val
-        log.info(f"[Phase1A-FUND] 资金流板块数: {len(result)}")
-        return result
+        
+        if df is not None:
+            cols = [c for c in df.columns if '主力净流入' in c or '净流入' in c]
+            if not cols:
+                cols = [c for c in df.columns if '金额' in c or '流入' in c]
+            flow_col = cols[0] if cols else df.columns[2]
+            sector_col = [c for c in df.columns if '名称' in c or '板块' in c][0] if [c for c in df.columns if '名称' in c or '板块' in c] else df.columns[0]
+            df_sorted = df.sort_values(flow_col, ascending=False).head(20)
+            result = {}
+            for _, row in df_sorted.iterrows():
+                name = str(row.get(sector_col, '')).strip()
+                val_str = str(row.get(flow_col, 0))
+                val = safe_float(val_str.replace(',', '').replace('亿', '').replace('万', ''))
+                if '万' in val_str:
+                    val /= 10000
+                result[name] = val
+            log.info(f"[Phase1A-FUND] 资金流板块数: {len(result)}")
+            return result
+        return {}
     except Exception as e:
         log.error(f"[Phase1A-FUND] 失败: {e}")
         return {}
